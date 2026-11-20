@@ -1,12 +1,20 @@
 """SQLite 连接管理与表结构。
 
-持久化模型说明（重启后仍可读取已生效的图）：
+持久化模型说明（重启后仍可读取已生效的图与统计）：
 - first_test   : 首测原表，每片一份，坐标唯一
 - batch        : 复测批次主表，记录批号、旋转角、修订号
 - batch_row    : 复测原表（上传时的原始整数坐标 + 档位），改向不改原表
 - coverage     : 物化覆盖关系（旋转落点 -> 覆盖它的批次），改向只重算受影响晶粒
 - current_map  : 当前判级图，按片分页只读这一张表，不重扫各批原表
 - slice        : 片主表，version 为该片已提交状态的单调递增版本号
+- layout       : 曝光场布局主表（每片一份启用中的布局），version 为布局版号，
+                 map_version 为统计所对应的判级图版本
+- layout_defect_bin : 该布局的不良档位集合
+- field        : 布局内的曝光场（唯一场号 + 左下晶粒坐标）
+- field_die    : 物化场格位 -> 晶粒坐标映射（含场不存在晶粒的缺粒位置），
+                 复测/改向时按它定位受影响偏移
+- offset_stat  : 物化偏移统计（实测粒数、不良粒数），分页查询只读此表
+- offset_defect_field : 各偏移的不良场号明细
 """
 from __future__ import annotations
 
@@ -97,6 +105,72 @@ CREATE TABLE IF NOT EXISTS current_map (
     source    TEXT NOT NULL CHECK (source IN ('first', 'retest')),
     batch_no  INTEGER,
     PRIMARY KEY (slice_id, x, y),
+    FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
+);
+
+-- 曝光场布局主表：每片一份启用中的布局；version 为布局版号（首次启用为 1），
+-- map_version 表示当前统计对应哪个已提交判级图版本
+CREATE TABLE IF NOT EXISTS layout (
+    slice_id    TEXT PRIMARY KEY,
+    version     INTEGER NOT NULL CHECK (version > 0),
+    field_w     INTEGER NOT NULL CHECK (field_w BETWEEN 1 AND 64),
+    field_h     INTEGER NOT NULL CHECK (field_h BETWEEN 1 AND 64),
+    map_version INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
+);
+
+-- 布局的不良档位集合
+CREATE TABLE IF NOT EXISTS layout_defect_bin (
+    slice_id  TEXT NOT NULL,
+    bin       TEXT NOT NULL,
+    PRIMARY KEY (slice_id, bin),
+    FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
+);
+
+-- 曝光场：唯一场号 + 左下晶粒坐标；场宽高统一记录在 layout 上
+CREATE TABLE IF NOT EXISTS field (
+    slice_id  TEXT NOT NULL,
+    field_id  TEXT NOT NULL,
+    origin_x  INTEGER NOT NULL,
+    origin_y  INTEGER NOT NULL,
+    PRIMARY KEY (slice_id, field_id),
+    FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
+);
+
+-- 物化场格位 -> 晶粒坐标映射：每个 (场, 偏移) 一行；
+-- 场互不重叠，故每个晶粒坐标至多属于一个场
+CREATE TABLE IF NOT EXISTS field_die (
+    slice_id  TEXT NOT NULL,
+    x         INTEGER NOT NULL,
+    y         INTEGER NOT NULL,
+    field_id  TEXT NOT NULL,
+    dx        INTEGER NOT NULL,
+    dy        INTEGER NOT NULL,
+    PRIMARY KEY (slice_id, x, y),
+    FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
+);
+CREATE INDEX IF NOT EXISTS idx_field_die_offset
+    ON field_die (slice_id, dx, dy);
+
+-- 物化偏移统计：每个偏移一行，分页查询只读此表；缺粒不计入实测数
+CREATE TABLE IF NOT EXISTS offset_stat (
+    slice_id  TEXT NOT NULL,
+    dx        INTEGER NOT NULL,
+    dy        INTEGER NOT NULL,
+    measured  INTEGER NOT NULL,
+    defective INTEGER NOT NULL,
+    PRIMARY KEY (slice_id, dx, dy),
+    FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
+);
+
+-- 各偏移的不良场号明细
+CREATE TABLE IF NOT EXISTS offset_defect_field (
+    slice_id  TEXT NOT NULL,
+    dx        INTEGER NOT NULL,
+    dy        INTEGER NOT NULL,
+    field_id  TEXT NOT NULL,
+    PRIMARY KEY (slice_id, dx, dy, field_id),
     FOREIGN KEY (slice_id) REFERENCES slice(slice_id)
 );
 """

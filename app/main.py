@@ -1,6 +1,6 @@
-"""FastAPI 入口：判级图 API。
+"""FastAPI 入口：判级图 + 曝光场偏移统计 API。
 
-交互式文档：启动后访问 /docs ，按片号分开上传首测与复测 CSV。
+交互式文档：启动后访问 /docs ，按片号分开上传首测、复测与曝光场布局 CSV。
 """
 from __future__ import annotations
 
@@ -9,14 +9,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, Query, UploadFile, status
 
-from . import services
+from . import layout, services
 from .config import settings
-from .csv_utils import CsvError, parse_die_csv
+from .csv_utils import CsvError, parse_die_csv, parse_layout_csv
 from .database import get_conn, init_db
 from .schemas import (
     BatchUploadResponse,
     FirstUploadResponse,
+    LayoutEnableResponse,
     MapPage,
+    OffsetPage,
     ReorientResponse,
     SliceInfo,
 )
@@ -35,8 +37,11 @@ app = FastAPI(
         "按晶粒坐标取档位。首测每片一份；复测按批号入库，提交逆时针旋转角，"
         "落点必须全在首测图上。改向带修订号做乐观并发控制，只重算受影响晶粒。"
         "每粒取覆盖它的最高批号档位，无复测覆盖时取首测。"
+        "支持上传曝光场布局（唯一场号 + 左下晶粒坐标，统一宽高，互不重叠），"
+        "按各场左下格起算的偏移聚合实测/不良粒数与不良场号，用于叠场排查光罩缺陷；"
+        "统计物化留存，随判级图提交同步增量更新。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -136,7 +141,7 @@ def get_map(
     "/slices/{slice_id}",
     response_model=SliceInfo,
     tags=["判级图"],
-    summary="查看片信息与各复测批（含当前修订号、旋转角）",
+    summary="查看片信息与各复测批（含当前修订号、旋转角）及启用中的布局",
 )
 def get_slice(
     slice_id: str,
@@ -144,6 +149,62 @@ def get_slice(
 ) -> dict:
     _check_slice_id(slice_id)
     return services.get_slice_info(conn, slice_id)
+
+
+@app.post(
+    "/slices/{slice_id}/layout",
+    response_model=LayoutEnableResponse,
+    tags=["布局"],
+    summary="上传并启用曝光场布局（按已有片号，带所见布局版号，首次为 0）",
+)
+def upload_layout(
+    slice_id: str,
+    field_width: int = Form(..., description="场宽（格），1～64，各场统一"),
+    field_height: int = Form(..., description="场高（格），1～64，各场统一"),
+    defect_bins: str = Form(..., description="不良档位，逗号分隔，如 C,D"),
+    expected_layout_version: int = Form(
+        ..., description="所见布局版号（乐观并发控制，首次上传为 0），过期则拒绝"
+    ),
+    file: UploadFile = File(
+        ..., description="CSV 文件，表头 field_id,x,y，每行唯一场号 + 左下晶粒坐标"
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    _check_slice_id(slice_id)
+    try:
+        rows = parse_layout_csv(file.file.read())
+    except CsvError as exc:
+        raise services.ServiceError(services.BAD_REQUEST, str(exc))
+    return layout.upload_layout(
+        conn,
+        slice_id,
+        field_width,
+        field_height,
+        defect_bins,
+        expected_layout_version,
+        rows,
+    )
+
+
+@app.get(
+    "/slices/{slice_id}/offsets",
+    response_model=OffsetPage,
+    tags=["布局"],
+    summary="分页取各偏移的叠场统计（实测/不良粒数、不良场号，只读物化统计）",
+)
+def get_offsets(
+    slice_id: str,
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(0, description="页大小，留空取服务端默认值"),
+    layout_version: int | None = Query(
+        None, description="可选，期望的布局版号；与当前版号不一致时返回 409，便于翻页一致性校验"
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    _check_slice_id(slice_id)
+    if page_size == 0:
+        page_size = settings.default_page_size
+    return layout.get_offset_page(conn, slice_id, page, page_size, layout_version)
 
 
 def _check_slice_id(slice_id: str) -> None:

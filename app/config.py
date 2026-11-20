@@ -16,6 +16,10 @@ class Settings:
         # 片号、档位字符串长度保护
         self.max_slice_id_len: int = int(os.getenv("GRADING_MAX_SLICE_ID_LEN", "128"))
         self.max_bin_len: int = int(os.getenv("GRADING_MAX_BIN_LEN", "64"))
+        # 曝光场布局：每片最多场数、场宽/高上限（格）、场号长度
+        self.max_fields_per_slice: int = int(os.getenv("GRADING_MAX_FIELDS_PER_SLICE", "64"))
+        self.max_field_dim: int = int(os.getenv("GRADING_MAX_FIELD_DIM", "64"))
+        self.max_field_id_len: int = int(os.getenv("GRADING_MAX_FIELD_ID_LEN", "64"))
 
 
 settings = Settings()

@@ -51,11 +51,55 @@ class BatchInfo(BaseModel):
     die_count: int
 
 
+class LayoutInfo(BaseModel):
+    version: int = Field(..., description="当前启用的布局版号（首次启用为 1）")
+    field_count: int = Field(..., description="布局内曝光场数")
+    field_width: int = Field(..., description="场宽（格）")
+    field_height: int = Field(..., description="场高（格）")
+    defect_bins: list[str] = Field(..., description="不良档位集合")
+    map_version: int = Field(..., description="统计所对应的判级图版本")
+
+
+class LayoutEnableResponse(BaseModel):
+    slice_id: str
+    layout_version: int = Field(..., description="启用后的布局版号")
+    map_version: int = Field(..., description="统计所对应的判级图版本")
+    field_count: int
+    field_width: int
+    field_height: int
+    defect_bins: list[str]
+    recomputed: bool = Field(
+        ..., description="读图后启用前判级图有更新，已按最新已提交图重算统计"
+    )
+
+
+class OffsetItem(BaseModel):
+    dx: int = Field(..., description="相对场左下格的横向偏移")
+    dy: int = Field(..., description="相对场左下格的纵向偏移")
+    measured: int = Field(..., description="实测粒数（缺粒不计入）")
+    defective: int = Field(..., description="不良粒数")
+    defect_fields: list[str] = Field(..., description="该偏移处不良的场号")
+
+
+class OffsetPage(BaseModel):
+    slice_id: str
+    layout_version: int = Field(..., description="本页统计所属的布局版号")
+    map_version: int = Field(..., description="本页统计对应的判级图版本")
+    field_width: int
+    field_height: int
+    defect_bins: list[str]
+    page: int
+    page_size: int
+    total: int
+    items: list[OffsetItem]
+
+
 class SliceInfo(BaseModel):
     slice_id: str
     version: int
     first_die_count: int
     batches: list[BatchInfo]
+    layout: LayoutInfo | None = Field(None, description="启用中的曝光场布局，未启用为 null")
 
 
 class ErrorBody(BaseModel):

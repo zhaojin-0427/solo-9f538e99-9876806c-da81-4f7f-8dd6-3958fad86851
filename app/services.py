@@ -5,32 +5,26 @@
   上传和改向交错时严格按提交（拿到锁）顺序生效。
 - 每个片维护单调递增的 current_ver：每次成功提交 +1，并作为该批的修订号返回。
 - 读操作不开写锁，在单个只读事务里取快照，每页只读到某个已提交状态。
+- 复测上传/改向提交时，对档位实际变化的晶粒同步增量维护曝光场偏移统计
+  （见 layout.apply_bin_changes），与判级图在同一事务内提交，任一失败整体回滚。
 """
 from __future__ import annotations
 
 import sqlite3
 
+from . import layout
 from .config import settings
 from .csv_utils import DieRow
 from .database import write_lock
+from .errors import (  # noqa: F401  （re-export，保持 services.ServiceError 等用法可用）
+    BAD_REQUEST,
+    CONFLICT,
+    INTERNAL,
+    NOT_FOUND,
+    UNPROCESSABLE,
+    ServiceError,
+)
 from .rotation import rotate_ccw
-
-
-class ServiceError(Exception):
-    """业务错误，http_status 决定返回码。"""
-
-    def __init__(self, http_status: int, message: str) -> None:
-        super().__init__(message)
-        self.http_status = http_status
-        self.message = message
-
-
-# 409 冲突：状态冲突 / 修订过期
-CONFLICT = 409
-# 422：提交内容本身不合法（落点不在首测图上等）
-UNPROCESSABLE = 422
-# 400：参数格式错误
-BAD_REQUEST = 400
 
 
 def _touch_slice(cur: sqlite3.Cursor, slice_id: str) -> int:
@@ -102,6 +96,48 @@ def _recompute(cur: sqlite3.Cursor, slice_id: str) -> int:
     )
     cur.execute("SELECT COUNT(*) FROM affected")
     return int(cur.fetchone()[0])
+
+
+def _snapshot_old_bins(cur: sqlite3.Cursor, slice_id: str) -> None:
+    """把受影响晶粒在重算前的档位快照到 TEMP 表 affected_old。"""
+    cur.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS affected_old("
+        "slice_id TEXT, x INTEGER, y INTEGER, bin TEXT, "
+        "PRIMARY KEY(slice_id, x, y))"
+    )
+    cur.execute("DELETE FROM affected_old")
+    cur.execute(
+        """
+        INSERT INTO affected_old(slice_id, x, y, bin)
+        SELECT cm.slice_id, cm.x, cm.y, cm.bin
+          FROM current_map cm
+          JOIN affected a
+            ON a.slice_id = cm.slice_id AND a.x = cm.x AND a.y = cm.y
+         WHERE cm.slice_id = ?
+        """,
+        (slice_id,),
+    )
+
+
+def _build_bin_change(cur: sqlite3.Cursor, slice_id: str) -> None:
+    """重算后对比快照，把档位实际变化的晶粒写入 TEMP 表 bin_change。"""
+    cur.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS bin_change("
+        "slice_id TEXT, x INTEGER, y INTEGER, old_bin TEXT, new_bin TEXT, "
+        "PRIMARY KEY(slice_id, x, y))"
+    )
+    cur.execute("DELETE FROM bin_change")
+    cur.execute(
+        """
+        INSERT INTO bin_change(slice_id, x, y, old_bin, new_bin)
+        SELECT ao.slice_id, ao.x, ao.y, ao.bin, cm.bin
+          FROM affected_old ao
+          JOIN current_map cm
+            ON cm.slice_id = ao.slice_id AND cm.x = ao.x AND cm.y = ao.y
+         WHERE ao.slice_id = ? AND ao.bin <> cm.bin
+        """,
+        (slice_id,),
+    )
 
 
 def submit_first_test(
@@ -221,8 +257,14 @@ def submit_batch(
                 "INSERT OR IGNORE INTO affected(slice_id, x, y) VALUES (?, ?, ?)",
                 [(slice_id, lx, ly) for (lx, ly, _) in landed],
             )
+            _snapshot_old_bins(cur, slice_id)
             affected = _recompute(cur, slice_id)
+            _build_bin_change(cur, slice_id)
+            # 档位变化影响的偏移统计与判级图同事务提交，任一失败整体回滚
+            layout.apply_bin_changes(cur, slice_id, revision)
             cur.execute("DROP TABLE affected")
+            cur.execute("DROP TABLE affected_old")
+            cur.execute("DROP TABLE bin_change")
             conn.commit()
         except ServiceError:
             conn.rollback()
@@ -322,14 +364,20 @@ def reorient_batch(
                 [(slice_id, nx, ny, batch_no, b) for (nx, ny, b) in new_landed],
             )
 
+            _snapshot_old_bins(cur, slice_id)
             affected = _recompute(cur, slice_id)
+            _build_bin_change(cur, slice_id)
 
             revision = _touch_slice(cur, slice_id)
+            # 档位变化影响的偏移统计与判级图同事务提交，任一失败整体回滚
+            layout.apply_bin_changes(cur, slice_id, revision)
             cur.execute(
                 "UPDATE batch SET rotation = ?, revision = ? WHERE slice_id = ? AND batch_no = ?",
                 (new_rotation, revision, slice_id, batch_no),
             )
             cur.execute("DROP TABLE affected")
+            cur.execute("DROP TABLE affected_old")
+            cur.execute("DROP TABLE bin_change")
             conn.commit()
         except ServiceError:
             conn.rollback()
@@ -442,6 +490,7 @@ def get_slice_info(conn: sqlite3.Connection, slice_id: str) -> dict:
             }
             for r in cur.fetchall()
         ]
+        layout_info = layout.get_layout_summary(cur, slice_id)
     finally:
         conn.rollback()
     return {
@@ -449,4 +498,5 @@ def get_slice_info(conn: sqlite3.Connection, slice_id: str) -> dict:
         "version": version,
         "first_die_count": first_count,
         "batches": batches,
+        "layout": layout_info,
     }
